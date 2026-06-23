@@ -580,9 +580,9 @@ def main():
 
     # Schedule every hour at :30 minutes (IST) — matches Binance UTC candle close
     # Binance 1H candles close at :00 UTC = :30 IST (since IST = UTC+5:30)
-    schedule.every().hour.at(":30").do(run_scan, symbols=symbols)
+    schedule.every().hour.at(":01").do(run_scan, symbols=symbols)
 
-    print(f"\n✅ Scanner running! Checks every hour at :30 IST (matches Binance UTC candle close)")
+    print(f"\n✅ Scanner running! Checks every hour at :01 UTC (1 min after Delta 1H candle close)")
     print(f"📱 WhatsApp alerts active")
     print(f"Press Ctrl+C to stop\n")
 
