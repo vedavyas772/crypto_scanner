@@ -198,3 +198,222 @@ def get_pa_context(df, level_price, signal_type):
     except Exception as e:
         fallback["trend_reason"] = f"PA analysis failed: {e}"
         return fallback
+
+
+# =============================================================================
+# ANNOTATION 1 — VOLUME CONFIRMATION
+# Is the breakout candle's volume significantly above recent average?
+# High volume on a pivot break = real participation.
+# Low volume = thin move, more likely to reverse.
+# =============================================================================
+
+def get_volume_context(df, lookback=20):
+    """
+    Compares the current (signal) candle's volume against the recent average.
+    Returns a dict with ratio, label, and emoji for the alert message.
+    Never raises — returns a safe fallback on any error.
+    """
+    try:
+        if df is None or len(df) < lookback + 1:
+            return {"label": "UNKNOWN", "ratio": None, "emoji": "❓",
+                    "detail": "Not enough candles"}
+
+        current_vol = df.iloc[-1]["volume"]
+        avg_vol     = df.iloc[-(lookback + 1):-1]["volume"].mean()
+
+        if avg_vol == 0:
+            return {"label": "UNKNOWN", "ratio": None, "emoji": "❓",
+                    "detail": "Avg volume is zero"}
+
+        ratio = round(current_vol / avg_vol, 2)
+
+        if ratio >= 3.0:
+            label, emoji = "VERY HIGH", "🔥"
+        elif ratio >= 2.0:
+            label, emoji = "HIGH", "✅"
+        elif ratio >= 1.2:
+            label, emoji = "ABOVE AVG", "📊"
+        elif ratio >= 0.8:
+            label, emoji = "AVERAGE", "➡️"
+        else:
+            label, emoji = "LOW", "⚠️"
+
+        return {
+            "label" : label,
+            "ratio" : ratio,
+            "emoji" : emoji,
+            "detail": f"{ratio}x the {lookback}-candle average"
+        }
+
+    except Exception as e:
+        return {"label": "ERROR", "ratio": None, "emoji": "❓",
+                "detail": str(e)}
+
+
+# =============================================================================
+# ANNOTATION 2 — CANDLE CLOSE QUALITY
+# Did the signal candle close with conviction?
+#   BUY signal: candle should close near its HIGH (bullish close)
+#   SELL signal: candle should close near its LOW (bearish close)
+# A candle that breaks a level but closes in the middle of its range
+# shows indecision — less reliable.
+# =============================================================================
+
+def get_candle_quality(df, signal_type):
+    """
+    Measures where the candle closed within its high-low range.
+    Returns a dict with score (0-100), label, and emoji.
+    """
+    try:
+        if df is None or len(df) < 1:
+            return {"label": "UNKNOWN", "score": None, "emoji": "❓",
+                    "detail": "No candle data"}
+
+        c     = df.iloc[-1]
+        high  = c["high"]
+        low   = c["low"]
+        close = c["close"]
+        rng   = high - low
+
+        if rng == 0:
+            return {"label": "DOJI", "score": 50, "emoji": "➡️",
+                    "detail": "No range — doji candle"}
+
+        # Position of close within the candle's range (0 = at low, 1 = at high)
+        close_position = (close - low) / rng
+
+        if signal_type == "BUY":
+            # For BUY: higher close position = better (closed near high)
+            score = round(close_position * 100)
+            if score >= 75:
+                label, emoji = "STRONG CLOSE", "✅"
+            elif score >= 50:
+                label, emoji = "MODERATE CLOSE", "➡️"
+            else:
+                label, emoji = "WEAK CLOSE", "⚠️"
+            detail = f"Closed in top {100-score}% of range" if score >= 50 else f"Closed in bottom {score}% of range"
+        else:
+            # For SELL: lower close position = better (closed near low)
+            score = round((1 - close_position) * 100)
+            if score >= 75:
+                label, emoji = "STRONG CLOSE", "✅"
+            elif score >= 50:
+                label, emoji = "MODERATE CLOSE", "➡️"
+            else:
+                label, emoji = "WEAK CLOSE", "⚠️"
+            detail = f"Closed in bottom {100-score}% of range" if score >= 50 else f"Closed in top {score}% of range"
+
+        return {
+            "label" : label,
+            "score" : score,
+            "emoji" : emoji,
+            "detail": detail
+        }
+
+    except Exception as e:
+        return {"label": "ERROR", "score": None, "emoji": "❓",
+                "detail": str(e)}
+
+
+# =============================================================================
+# ANNOTATION 3 — HIGHER TIMEFRAME (4H) PIVOT ALIGNMENT
+# Does the 4H pivot level context agree with the signal direction?
+# A SELL signal with the 4H pivot structure also bearish = stronger.
+# A BUY signal going against the 4H structure = be cautious.
+# Fetches 4H candles from Delta and calculates Fibonacci pivots on weekly 4H OHLC.
+# =============================================================================
+
+def get_4h_alignment(symbol, signal_type, delta_base_url="https://api.india.delta.exchange"):
+    """
+    Fetches the last 50 4H candles from Delta and checks:
+    1. Where is price relative to the 4H pivot (P)?
+       - Price above 4H P + BUY signal = aligned (bullish on both TFs)
+       - Price below 4H P + SELL signal = aligned (bearish on both TFs)
+       - Opposite = counter-HTF
+    2. What direction is the 4H EMA9 vs EMA26?
+    Returns a dict with alignment label and emoji.
+    """
+    try:
+        import requests
+        from datetime import datetime, timedelta, timezone
+
+        end_ts   = int(datetime.now(timezone.utc).timestamp())
+        start_ts = end_ts - 50 * 4 * 3600  # last 50 4H candles
+
+        url    = f"{delta_base_url}/v2/history/candles"
+        params = {"symbol": symbol, "resolution": "4h",
+                  "start": start_ts, "end": end_ts}
+        resp   = requests.get(url, params=params, timeout=8)
+        data   = resp.json()
+
+        if not data.get("success") or not data.get("result"):
+            return {"label": "UNAVAILABLE", "emoji": "❓",
+                    "detail": "Could not fetch 4H data"}
+
+        candles_4h = data["result"]
+        if not isinstance(candles_4h, list) or len(candles_4h) < 10:
+            return {"label": "UNAVAILABLE", "emoji": "❓",
+                    "detail": f"Only {len(candles_4h)} 4H candles returned"}
+
+        df4 = pd.DataFrame(candles_4h).astype({
+            "open": float, "high": float, "low": float,
+            "close": float, "volume": float
+        })
+        df4 = df4.sort_values("time").reset_index(drop=True)
+
+        # Drop forming candle
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        now_4h_ts = int(now_ts // (4 * 3600) * (4 * 3600))
+        if df4.iloc[-1]["time"] >= now_4h_ts:
+            df4 = df4.iloc[:-1].reset_index(drop=True)
+
+        if len(df4) < 5:
+            return {"label": "UNAVAILABLE", "emoji": "❓",
+                    "detail": "Not enough closed 4H candles"}
+
+        # Simple 4H pivot: use last completed 4H session high/low/close
+        # (we use last 6 4H candles = 1 day as the "session")
+        session = df4.iloc[-7:-1] if len(df4) >= 7 else df4.iloc[:-1]
+        h4_high  = session["high"].max()
+        h4_low   = session["low"].min()
+        h4_close = session.iloc[-1]["close"]
+        h4_pivot = (h4_high + h4_low + h4_close) / 3
+
+        current_price = df4.iloc[-1]["close"]
+
+        # 4H EMA direction
+        df4["ema9"]  = df4["close"].ewm(span=9,  adjust=False).mean()
+        df4["ema26"] = df4["close"].ewm(span=26, adjust=False).mean()
+        h4_ema9  = df4.iloc[-1]["ema9"]
+        h4_ema26 = df4.iloc[-1]["ema26"]
+        h4_bullish = h4_ema9 > h4_ema26
+        h4_bearish = h4_ema9 < h4_ema26
+
+        price_above_pivot = current_price > h4_pivot
+
+        if signal_type == "BUY" and price_above_pivot and h4_bullish:
+            label, emoji = "ALIGNED ✅", "📈"
+            detail = f"4H price above pivot ({round(h4_pivot,4)}), 4H EMA bullish"
+        elif signal_type == "SELL" and not price_above_pivot and h4_bearish:
+            label, emoji = "ALIGNED ✅", "📉"
+            detail = f"4H price below pivot ({round(h4_pivot,4)}), 4H EMA bearish"
+        elif signal_type == "BUY" and not price_above_pivot:
+            label, emoji = "COUNTER-HTF ⚠️", "⚠️"
+            detail = f"4H price below pivot ({round(h4_pivot,4)}) — buying against 4H structure"
+        elif signal_type == "SELL" and price_above_pivot:
+            label, emoji = "COUNTER-HTF ⚠️", "⚠️"
+            detail = f"4H price above pivot ({round(h4_pivot,4)}) — selling against 4H structure"
+        else:
+            label, emoji = "NEUTRAL ➡️", "➡️"
+            detail = f"4H price {'above' if price_above_pivot else 'below'} pivot ({round(h4_pivot,4)}), EMA mixed"
+
+        return {
+            "label" : label,
+            "emoji" : emoji,
+            "detail": detail,
+            "h4_pivot"   : round(h4_pivot, 6),
+            "h4_ema_bias": "bullish" if h4_bullish else "bearish" if h4_bearish else "flat"
+        }
+
+    except Exception as e:
+        return {"label": "ERROR", "emoji": "❓", "detail": str(e)}
