@@ -334,28 +334,36 @@ def detect_signals(symbol, df, pivots):
                         buy_st["phase"], buy_st["break_idx"], buy_st["cross_idx"] = "idle", None, None
 
         # ── AGGRESSIVE path: crossover-first, break-second, ONE-SHOT per crossover ──
+        # Uses candle TIMESTAMP (not DataFrame index) to track which crossover
+        # was last used — timestamps are stable across hourly scans even as
+        # the DataFrame window slides, unlike row indices which shift each scan.
         if is_latest:
             lookback_start = max(0, i - MAX_WAIT_FOR_CROSS)
             window = df.iloc[lookback_start:i + 1]
 
-            # Most recent bear/bull crossover in the lookback window, if any
+            # Most recent bear/bull crossover — get its TIMESTAMP for stable tracking
             bear_rows = window[window["bear_cross"]]
-            most_recent_bear_cross = bear_rows.index[-1] if not bear_rows.empty else None
+            most_recent_bear_cross_ts = (
+                float(df.iloc[bear_rows.index[-1]]["time"])
+                if not bear_rows.empty else None
+            )
 
             bull_rows = window[window["bull_cross"]]
-            most_recent_bull_cross = bull_rows.index[-1] if not bull_rows.empty else None
+            most_recent_bull_cross_ts = (
+                float(df.iloc[bull_rows.index[-1]]["time"])
+                if not bull_rows.empty else None
+            )
 
             for level_name, level_price in pivot_levels.items():
                 prior_closes = [df.iloc[i - n]["close"] for n in range(1, CHOP_FILTER_CANDLES + 1)]
                 clean_break_below = candle["close"] < level_price and all(c >= level_price for c in prior_closes)
                 clean_break_above = candle["close"] > level_price and all(c <= level_price for c in prior_closes)
 
-                # SELL: only fire if this crossover index hasn't already
-                # produced an aggressive SELL before (any pivot level).
+                # SELL: fire only if the crossover timestamp hasn't been used before
                 if (clean_break_below
-                        and most_recent_bear_cross is not None
-                        and most_recent_bear_cross != state["_agg_bear_cross_used"]):
-                    sig_key = f"{symbol}_AGG_SELL_{level_name}_{most_recent_bear_cross}"
+                        and most_recent_bear_cross_ts is not None
+                        and most_recent_bear_cross_ts != state["_agg_bear_cross_used"]):
+                    sig_key = f"{symbol}_AGG_SELL_{level_name}_{most_recent_bear_cross_ts}"
                     if sig_key not in alerted_this_cycle:
                         signals.append({
                             "symbol": symbol, "type": "SELL", "entry": "AGGRESSIVE",
@@ -365,13 +373,13 @@ def detect_signals(symbol, df, pivots):
                             "time": candle_time_str(i),
                         })
                         alerted_this_cycle.add(sig_key)
-                        state["_agg_bear_cross_used"] = most_recent_bear_cross
+                        state["_agg_bear_cross_used"] = most_recent_bear_cross_ts
 
-                # BUY: same one-shot-per-crossover rule.
+                # BUY: same one-shot-per-crossover rule using timestamp
                 if (clean_break_above
-                        and most_recent_bull_cross is not None
-                        and most_recent_bull_cross != state["_agg_bull_cross_used"]):
-                    sig_key = f"{symbol}_AGG_BUY_{level_name}_{most_recent_bull_cross}"
+                        and most_recent_bull_cross_ts is not None
+                        and most_recent_bull_cross_ts != state["_agg_bull_cross_used"]):
+                    sig_key = f"{symbol}_AGG_BUY_{level_name}_{most_recent_bull_cross_ts}"
                     if sig_key not in alerted_this_cycle:
                         signals.append({
                             "symbol": symbol, "type": "BUY", "entry": "AGGRESSIVE",
@@ -381,7 +389,7 @@ def detect_signals(symbol, df, pivots):
                             "time": candle_time_str(i),
                         })
                         alerted_this_cycle.add(sig_key)
-                        state["_agg_bull_cross_used"] = most_recent_bull_cross
+                        state["_agg_bull_cross_used"] = most_recent_bull_cross_ts
 
     state["_last_idx"] = curr_idx
     return signals
@@ -458,26 +466,31 @@ def send_alert(signal, df=None):
         else:
             msg += f"📋 Setup: EMA crossed ↑ → Price closed above {signal['pivot_name']}\n"
 
-    # ── PA CONTEXT (annotation only — never affects whether this signal fires) ──
-    # This block is fully isolated: if it errors for any reason, the alert
-    # still sends normally below, just without these two extra lines.
+    # ── ANNOTATIONS (pure context — never affects whether this signal fires) ──
     if df is not None:
         try:
-            from pa_analysis import get_pa_context
-            pa = get_pa_context(df, signal["pivot_price"], direction)
+            from pa_analysis import (get_pa_context, get_volume_context,
+                                     get_candle_quality, get_4h_alignment)
+            pa  = get_pa_context(df, signal["pivot_price"], direction)
+            vol = get_volume_context(df)
+            cq  = get_candle_quality(df, direction)
+            h4  = get_4h_alignment(signal["symbol"], direction)
 
-            trend_emoji = {"UPTREND": "📈", "DOWNTREND": "📉", "RANGE/CONSOLIDATION": "↔️"}.get(pa["trend"], "❓")
+            trend_emoji = {"UPTREND": "📈", "DOWNTREND": "📉",
+                           "RANGE/CONSOLIDATION": "↔️"}.get(pa["trend"], "❓")
             msg += f"━━━━━━━━━━━━━━━━━━\n"
-            msg += f"{trend_emoji} Trend: {pa['trend']} ({pa['trend_reason']})\n"
+            msg += f"{trend_emoji} Trend     : {pa['trend']} ({pa['trend_reason']})\n"
             if pa["pa_score"] is not None:
                 bd = pa["breakdown"]
-                msg += (f"📐 PA Score: {pa['pa_score']}/100 "
+                msg += (f"📐 PA Score : {pa['pa_score']}/100 "
                         f"(level respected {bd.get('level_respects','?')}x in last 100h, "
                         f"candle {bd.get('body_vs_avg_ratio','?')}x avg, "
                         f"trend {bd.get('trend_alignment','?')})\n")
+            msg += f"{vol['emoji']} Volume    : {vol['label']} ({vol['detail']})\n"
+            msg += f"{cq['emoji']}  Close Qual: {cq['label']} ({cq['detail']})\n"
+            msg += f"{h4['emoji']} 4H Align  : {h4['label']} — {h4['detail']}\n"
         except Exception as e:
-            # Deliberately swallow — PA context is a bonus, not a requirement.
-            print(f"  (PA context skipped due to error: {e})")
+            print(f"  (Annotations skipped: {e})")
 
     msg += f"{emoji} {direction} {entry} CONFIRMED"
 
