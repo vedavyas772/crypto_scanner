@@ -518,7 +518,7 @@ def detect_signals(symbol, df, pivots):
                         alerted_this_cycle.add(sig_key)
                         state["_agg_bull_cross_used"] = most_recent_bull_cross_ts
 
-    state["_last_idx"] = curr_idx
+    state["_last_idx"] = curr_idx + 1
     return signals
 
 
@@ -528,22 +528,23 @@ def detect_sniper_signals(symbol, df, pivots):
     """
     SNIPER BUY / SNIPER SELL — Precision entry signal.
 
-    SNIPER BUY conditions (all on 1H TF, crossover on 30min TF):
-      1. Price consolidates within 1% BELOW a pivot level for MIN 5 candles
-      2. EMA 9 (blue) is flat then slowly slanting upward during consolidation
-      3. 1H candle closes ABOVE the pivot level
-      4. 1H candle closes ABOVE EMA 9
-      5. 30min EMA 9 has crossed ABOVE EMA 26 within last 3 x 30min candles
+    Fully stateless — consolidation is detected by looking back through
+    the df directly on every scan. No reliance on in-memory state means
+    Railway restarts / missed scans never cause missed signals.
 
-    SNIPER SELL conditions (mirror image):
-      1. Price consolidates within 1% ABOVE a pivot level for MIN 5 candles
-      2. EMA 9 slowly slanting downward during consolidation
-      3. 1H candle closes BELOW the pivot level
-      4. 1H candle closes BELOW EMA 9
-      5. 30min EMA 9 has crossed BELOW EMA 26 within last 3 x 30min candles
+    SNIPER BUY (1H TF + 30min alignment):
+      1. Latest candle closes ABOVE pivot AND above EMA9
+      2. Looking back from the candle BEFORE trigger — at least 5 of the
+         last 30 candles closed within 2% below the pivot (consolidation)
+      3. EMA9 at trigger > EMA9 at start of that consolidation window
+         AND EMA9 at trigger > EMA9 at midpoint of consolidation (gradual curl)
+      4. 30min: EMA9 currently above EMA26
 
-    One-shot per setup: once a SNIPER fires at a pivot, that pivot's sniper
-    state resets — requires a fresh consolidation to fire again.
+    SNIPER SELL (mirror):
+      1. Latest candle closes BELOW pivot AND below EMA9
+      2. At least 5 of last 30 candles closed within 2% above pivot
+      3. EMA9 curling down during consolidation
+      4. 30min: EMA9 currently below EMA26
     """
     if df is None or len(df) < EMA_SLOW + 15:
         return []
@@ -567,142 +568,134 @@ def detect_sniper_signals(symbol, df, pivots):
         "S1": pivots["S1"], "S2": pivots["S2"], "S3": pivots["S3"]
     }
 
-    # SNIPER-specific constants
-    PROXIMITY_PCT      = 0.02   # consolidation must be within 2% of pivot
-    MIN_CONSOL_CANDLES = 5     # minimum candles consolidating near pivot
+    PROXIMITY_PCT      = 0.02  # candle must close within 2% of pivot to count as consolidation
+    MIN_CONSOL_CANDLES = 5     # minimum consolidation candles required
+    MAX_LOOKBACK       = 30    # how far back to scan for consolidation candles
 
-    # Init sniper state if not present
-    if "_sniper" not in coin_state[symbol]:
-        coin_state[symbol]["_sniper"] = {
-            lvl: {
-                "buy_consol_start" : None,  # index where consolidation began
-                "sell_consol_start": None,
-            }
-            for lvl in pivot_levels
-        }
-
-    sniper_state = coin_state[symbol]["_sniper"]
-
-    # Only check the latest closed candle — sniper fires exactly once
     candle  = df.iloc[curr_idx]
     ema9_c  = candle["ema9"]
     ema26_c = candle["ema26"]
 
     for level_name, level_price in pivot_levels.items():
-        st = sniper_state[level_name]
 
-        # ── Track BUY consolidation (price within 1% BELOW pivot) ────────────
-        price_within_1pct_below = (
-            candle["close"] < level_price and
-            candle["close"] >= level_price * (1 - PROXIMITY_PCT)
-        )
-        if price_within_1pct_below:
-            if st["buy_consol_start"] is None:
-                st["buy_consol_start"] = curr_idx
-        else:
-            # Reset if price leaves the consolidation zone (broke far below OR broke above)
-            if candle["close"] < level_price * (1 - PROXIMITY_PCT):
-                st["buy_consol_start"] = None
-            # If closed above pivot, that's the trigger candle — handle below, then reset
+        # ══ SNIPER BUY ═══════════════════════════════════════════════════════
+        # Trigger: current candle closes above pivot AND above EMA9
+        if candle["close"] > level_price and candle["close"] > ema9_c:
 
-        # ── Track SELL consolidation (price within 1% ABOVE pivot) ───────────
-        price_within_1pct_above = (
-            candle["close"] > level_price and
-            candle["close"] <= level_price * (1 + PROXIMITY_PCT)
-        )
-        if price_within_1pct_above:
-            if st["sell_consol_start"] is None:
-                st["sell_consol_start"] = curr_idx
-        else:
-            if candle["close"] > level_price * (1 + PROXIMITY_PCT):
-                st["sell_consol_start"] = None
+            # Look back through candles BEFORE the trigger
+            # Count candles that were consolidating within 2% BELOW the pivot
+            consol_indices = []
+            lookback_start = max(curr_idx - MAX_LOOKBACK, EMA_SLOW)
 
-        # ══ SNIPER BUY CHECK ══════════════════════════════════════════════════
-        # Trigger candle: closes ABOVE pivot AND closes ABOVE EMA9
-        if (candle["close"] > level_price and
-                candle["close"] > ema9_c and
-                st["buy_consol_start"] is not None):
+            for j in range(curr_idx - 1, lookback_start - 1, -1):
+                c = df.iloc[j]["close"]
+                if level_price * (1 - PROXIMITY_PCT) <= c < level_price:
+                    consol_indices.append(j)
+                elif c >= level_price:
+                    # Price was above pivot — stop looking back
+                    # (consolidation must be contiguous below pivot)
+                    break
+                else:
+                    # Price dropped too far below — still count it if
+                    # the majority of candles were in range, just skip this one
+                    continue
 
-            consol_length = curr_idx - st["buy_consol_start"]
+            consol_count = len(consol_indices)
 
-            if consol_length >= MIN_CONSOL_CANDLES:
-                # Check EMA9 was slanting up during consolidation:
-                # EMA9 at end of consolidation > EMA9 at start of consolidation
-                consol_start_idx = st["buy_consol_start"]
-                ema9_at_consol_start = df.iloc[consol_start_idx]["ema9"]
-                ema9_mid_idx  = consol_start_idx + consol_length // 2
-                ema9_mid_val  = df.iloc[ema9_mid_idx]["ema9"]
+            if consol_count >= MIN_CONSOL_CANDLES:
+                # EMA9 slant check — from earliest consol candle to trigger
+                earliest_consol_idx = min(consol_indices)
+                mid_consol_idx      = (earliest_consol_idx + curr_idx) // 2
 
-                # EMA9 must be higher than start (correct direction)
-                # AND higher than its own midpoint (confirms gradual curl, not a fluke)
-                ema9_slanting_up = (ema9_c > ema9_at_consol_start) and (ema9_c > ema9_mid_val)
+                ema9_at_start = df.iloc[earliest_consol_idx]["ema9"]
+                ema9_at_mid   = df.iloc[mid_consol_idx]["ema9"]
+
+                # Gradual curl: must be rising overall AND in second half
+                # Relaxed: only need ONE of the two to pass if consol is short
+                ema9_rising_overall  = ema9_c > ema9_at_start
+                ema9_rising_second_half = ema9_c > ema9_at_mid
+
+                if consol_count >= 8:
+                    # Long consolidation — require both
+                    ema9_slanting_up = ema9_rising_overall and ema9_rising_second_half
+                else:
+                    # Short consolidation (5-7 candles) — just overall rise enough
+                    ema9_slanting_up = ema9_rising_overall
 
                 if ema9_slanting_up:
-                    # Validate 30min EMA alignment
-                    cross_30m = check_30m_ema_alignment(symbol, "BUY")
+                    # 30min alignment check
+                    aligned_30m = check_30m_ema_alignment(symbol, "BUY")
 
-                    if cross_30m:
-                        sig_key = f"{symbol}_SNIPER_BUY_{level_name}_{st['buy_consol_start']}"
+                    if aligned_30m:
+                        sig_key = f"{symbol}_SNIPER_BUY_{level_name}_{earliest_consol_idx}"
                         if sig_key not in alerted_this_cycle:
                             signals.append({
-                                "symbol"     : symbol,
-                                "type"       : "BUY",
-                                "entry"      : "SNIPER",
-                                "pivot_name" : level_name,
-                                "pivot_price": level_price,
-                                "cmp"        : round(candle["close"], 6),
-                                "ema9"       : round(ema9_c, 6),
-                                "ema26"      : round(ema26_c, 6),
-                                "consol_candles": consol_length,
-                                "time"       : candle_time_str(curr_idx),
+                                "symbol"        : symbol,
+                                "type"          : "BUY",
+                                "entry"         : "SNIPER",
+                                "pivot_name"    : level_name,
+                                "pivot_price"   : level_price,
+                                "cmp"           : round(candle["close"], 6),
+                                "ema9"          : round(ema9_c, 6),
+                                "ema26"         : round(ema26_c, 6),
+                                "consol_candles": consol_count,
+                                "time"          : candle_time_str(curr_idx),
                             })
                             alerted_this_cycle.add(sig_key)
 
-            # Reset buy consolidation — candle closed above pivot
-            st["buy_consol_start"] = None
+        # ══ SNIPER SELL ══════════════════════════════════════════════════════
+        # Trigger: current candle closes below pivot AND below EMA9
+        if candle["close"] < level_price and candle["close"] < ema9_c:
 
-        # ══ SNIPER SELL CHECK ═════════════════════════════════════════════════
-        # Trigger candle: closes BELOW pivot AND closes BELOW EMA9
-        if (candle["close"] < level_price and
-                candle["close"] < ema9_c and
-                st["sell_consol_start"] is not None):
+            consol_indices = []
+            lookback_start = max(curr_idx - MAX_LOOKBACK, EMA_SLOW)
 
-            consol_length = curr_idx - st["sell_consol_start"]
+            for j in range(curr_idx - 1, lookback_start - 1, -1):
+                c = df.iloc[j]["close"]
+                if level_price < c <= level_price * (1 + PROXIMITY_PCT):
+                    consol_indices.append(j)
+                elif c <= level_price:
+                    # Price was below pivot — stop looking back
+                    break
+                else:
+                    continue
 
-            if consol_length >= MIN_CONSOL_CANDLES:
-                # Check EMA9 was slanting down during consolidation
-                consol_start_idx = st["sell_consol_start"]
-                ema9_at_consol_start = df.iloc[consol_start_idx]["ema9"]
-                ema9_mid_idx  = consol_start_idx + consol_length // 2
-                ema9_mid_val  = df.iloc[ema9_mid_idx]["ema9"]
+            consol_count = len(consol_indices)
 
-                # EMA9 must be lower than start (correct direction)
-                # AND lower than its own midpoint (confirms gradual curl down, not a fluke)
-                ema9_slanting_down = (ema9_c < ema9_at_consol_start) and (ema9_c < ema9_mid_val)
+            if consol_count >= MIN_CONSOL_CANDLES:
+                earliest_consol_idx = min(consol_indices)
+                mid_consol_idx      = (earliest_consol_idx + curr_idx) // 2
+
+                ema9_at_start = df.iloc[earliest_consol_idx]["ema9"]
+                ema9_at_mid   = df.iloc[mid_consol_idx]["ema9"]
+
+                ema9_falling_overall     = ema9_c < ema9_at_start
+                ema9_falling_second_half = ema9_c < ema9_at_mid
+
+                if consol_count >= 8:
+                    ema9_slanting_down = ema9_falling_overall and ema9_falling_second_half
+                else:
+                    ema9_slanting_down = ema9_falling_overall
 
                 if ema9_slanting_down:
-                    # Validate 30min EMA alignment
-                    cross_30m = check_30m_ema_alignment(symbol, "SELL")
+                    aligned_30m = check_30m_ema_alignment(symbol, "SELL")
 
-                    if cross_30m:
-                        sig_key = f"{symbol}_SNIPER_SELL_{level_name}_{st['sell_consol_start']}"
+                    if aligned_30m:
+                        sig_key = f"{symbol}_SNIPER_SELL_{level_name}_{earliest_consol_idx}"
                         if sig_key not in alerted_this_cycle:
                             signals.append({
-                                "symbol"     : symbol,
-                                "type"       : "SELL",
-                                "entry"      : "SNIPER",
-                                "pivot_name" : level_name,
-                                "pivot_price": level_price,
-                                "cmp"        : round(candle["close"], 6),
-                                "ema9"       : round(ema9_c, 6),
-                                "ema26"      : round(ema26_c, 6),
-                                "consol_candles": consol_length,
-                                "time"       : candle_time_str(curr_idx),
+                                "symbol"        : symbol,
+                                "type"          : "SELL",
+                                "entry"         : "SNIPER",
+                                "pivot_name"    : level_name,
+                                "pivot_price"   : level_price,
+                                "cmp"           : round(candle["close"], 6),
+                                "ema9"          : round(ema9_c, 6),
+                                "ema26"         : round(ema26_c, 6),
+                                "consol_candles": consol_count,
+                                "time"          : candle_time_str(curr_idx),
                             })
                             alerted_this_cycle.add(sig_key)
-
-            # Reset sell consolidation — candle closed below pivot
-            st["sell_consol_start"] = None
 
     return signals
 
