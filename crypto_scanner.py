@@ -212,15 +212,15 @@ def get_30m_candles(symbol, limit=60):
         return None
 
 
-def check_30m_ema_crossover(symbol, direction):
+def check_30m_ema_alignment(symbol, direction):
     """
-    SNIPER helper — checks if the 30min EMA 9/26 crossover has happened
-    in the same direction as the signal, within the last 3 closed 30min candles.
+    SNIPER helper — checks if 30min EMA 9/26 alignment matches the trade direction.
 
-    direction = "BUY"  → needs EMA9 to have crossed ABOVE EMA26 recently
-    direction = "SELL" → needs EMA9 to have crossed BELOW EMA26 recently
+    direction = "BUY"  → EMA9 must be ABOVE EMA26 on the latest closed 30min candle
+    direction = "SELL" → EMA9 must be BELOW EMA26 on the latest closed 30min candle
 
-    Returns True if crossover confirmed, False otherwise.
+    No crossover event hunting — just current state of EMAs on 30min TF.
+    Returns True if aligned, False otherwise.
     """
     try:
         df30 = get_30m_candles(symbol, limit=60)
@@ -230,24 +230,12 @@ def check_30m_ema_crossover(symbol, direction):
         df30["ema9"]  = df30["close"].ewm(span=9,  adjust=False).mean()
         df30["ema26"] = df30["close"].ewm(span=26, adjust=False).mean()
 
-        # Check last 3 closed 30min candles for a crossover
-        LOOKBACK_30M = 3
-        recent = df30.iloc[-(LOOKBACK_30M + 1):]
+        latest = df30.iloc[-1]
 
-        for i in range(1, len(recent)):
-            prev = recent.iloc[i - 1]
-            curr = recent.iloc[i]
-
-            if direction == "BUY":
-                # EMA9 crossed above EMA26
-                if prev["ema9"] <= prev["ema26"] and curr["ema9"] > curr["ema26"]:
-                    return True
-            else:
-                # EMA9 crossed below EMA26
-                if prev["ema9"] >= prev["ema26"] and curr["ema9"] < curr["ema26"]:
-                    return True
-
-        return False
+        if direction == "BUY":
+            return latest["ema9"] > latest["ema26"]
+        else:
+            return latest["ema9"] < latest["ema26"]
 
     except Exception:
         return False
@@ -295,9 +283,12 @@ def detect_signals(symbol, df, pivots):
         a pivot with no fresh crossover involved.
 
     CHOP FILTER (applies to both paths):
-        A break only counts if the current candle closes on the new side AND
-        the prior CHOP_FILTER_CANDLES candles all closed on the old side.
-        Prevents instant flip-flopping from registering as a real break.
+        A "clean break" requires ALL THREE:
+        1. Previous candle closed on the OPPOSITE side of the pivot
+        2. Current candle closes beyond the pivot
+        3. At least 25% of the candle BODY closes beyond the pivot
+        Prevents signals on candles already sitting on the wrong side,
+        or candles that only barely clip the pivot with a tiny wick/body.
 
     Timestamps: every signal is stamped with the ACTUAL CANDLE's time (from
     the candle's own "time" field, converted to UTC), not the wall-clock
@@ -333,8 +324,8 @@ def detect_signals(symbol, df, pivots):
         "S1": pivots["S1"], "S2": pivots["S2"], "S3": pivots["S3"]
     }
 
-    MAX_WAIT_FOR_CROSS  = 15   # candles after break to wait for EMA crossover (RETEST path)
-    CHOP_FILTER_CANDLES = 2    # consecutive opposite-side closes required before a break counts
+    MAX_WAIT_FOR_CROSS   = 15   # candles after break to wait for EMA crossover (RETEST path)
+    MIN_BODY_BREAK_PCT   = 0.25 # at least 25% of candle body must close beyond pivot
 
     if (symbol not in coin_state
             or not isinstance(coin_state[symbol], dict)
@@ -353,7 +344,7 @@ def detect_signals(symbol, df, pivots):
         coin_state[symbol]["_agg_bull_cross_used"] = None
 
     state = coin_state[symbol]
-    start_idx = max(state.get("_last_idx", EMA_SLOW), EMA_SLOW, CHOP_FILTER_CANDLES + 1)
+    start_idx = max(state.get("_last_idx", EMA_SLOW), EMA_SLOW, 1)
 
     for i in range(start_idx, curr_idx + 1):
         candle    = df.iloc[i]
@@ -363,9 +354,27 @@ def detect_signals(symbol, df, pivots):
             sell_st = state[level_name]["sell"]
             buy_st  = state[level_name]["buy"]
 
-            prior_closes = [df.iloc[i - n]["close"] for n in range(1, CHOP_FILTER_CANDLES + 1)]
-            clean_break_below = candle["close"] < level_price and all(c >= level_price for c in prior_closes)
-            clean_break_above = candle["close"] > level_price and all(c <= level_price for c in prior_closes)
+            prev_close  = df.iloc[i - 1]["close"]
+            body_size   = abs(candle["close"] - candle["open"])
+
+            # SELL break: prev closed above pivot, current closes below
+            # + at least 25% of body is below pivot
+            if body_size > 0:
+                body_below  = (level_price - candle["close"]) / body_size
+                body_above  = (candle["close"] - level_price) / body_size
+            else:
+                body_below = body_above = 0.0
+
+            clean_break_below = (
+                prev_close  >= level_price and
+                candle["close"] <  level_price and
+                body_below  >= MIN_BODY_BREAK_PCT
+            )
+            clean_break_above = (
+                prev_close  <= level_price and
+                candle["close"] >  level_price and
+                body_above  >= MIN_BODY_BREAK_PCT
+            )
 
             # ── SELL state machine (RETEST path) ────────────────────────────
             if sell_st["phase"] == "idle":
@@ -457,9 +466,25 @@ def detect_signals(symbol, df, pivots):
             )
 
             for level_name, level_price in pivot_levels.items():
-                prior_closes = [df.iloc[i - n]["close"] for n in range(1, CHOP_FILTER_CANDLES + 1)]
-                clean_break_below = candle["close"] < level_price and all(c >= level_price for c in prior_closes)
-                clean_break_above = candle["close"] > level_price and all(c <= level_price for c in prior_closes)
+                prev_close_agg = df.iloc[i - 1]["close"]
+                body_size_agg  = abs(candle["close"] - candle["open"])
+
+                if body_size_agg > 0:
+                    body_below_agg = (level_price - candle["close"]) / body_size_agg
+                    body_above_agg = (candle["close"] - level_price) / body_size_agg
+                else:
+                    body_below_agg = body_above_agg = 0.0
+
+                clean_break_below = (
+                    prev_close_agg  >= level_price and
+                    candle["close"] <  level_price and
+                    body_below_agg  >= MIN_BODY_BREAK_PCT
+                )
+                clean_break_above = (
+                    prev_close_agg  <= level_price and
+                    candle["close"] >  level_price and
+                    body_above_agg  >= MIN_BODY_BREAK_PCT
+                )
 
                 # SELL: fire only if the crossover timestamp hasn't been used before
                 if (clean_break_below
@@ -543,7 +568,7 @@ def detect_sniper_signals(symbol, df, pivots):
     }
 
     # SNIPER-specific constants
-    PROXIMITY_PCT     = 0.01   # consolidation must be within 1% of pivot
+    PROXIMITY_PCT      = 0.02   # consolidation must be within 2% of pivot
     MIN_CONSOL_CANDLES = 5     # minimum candles consolidating near pivot
 
     # Init sniper state if not present
@@ -605,11 +630,16 @@ def detect_sniper_signals(symbol, df, pivots):
                 # EMA9 at end of consolidation > EMA9 at start of consolidation
                 consol_start_idx = st["buy_consol_start"]
                 ema9_at_consol_start = df.iloc[consol_start_idx]["ema9"]
-                ema9_slanting_up = ema9_c > ema9_at_consol_start
+                ema9_mid_idx  = consol_start_idx + consol_length // 2
+                ema9_mid_val  = df.iloc[ema9_mid_idx]["ema9"]
+
+                # EMA9 must be higher than start (correct direction)
+                # AND higher than its own midpoint (confirms gradual curl, not a fluke)
+                ema9_slanting_up = (ema9_c > ema9_at_consol_start) and (ema9_c > ema9_mid_val)
 
                 if ema9_slanting_up:
-                    # Validate 30min crossover
-                    cross_30m = check_30m_ema_crossover(symbol, "BUY")
+                    # Validate 30min EMA alignment
+                    cross_30m = check_30m_ema_alignment(symbol, "BUY")
 
                     if cross_30m:
                         sig_key = f"{symbol}_SNIPER_BUY_{level_name}_{st['buy_consol_start']}"
@@ -643,11 +673,16 @@ def detect_sniper_signals(symbol, df, pivots):
                 # Check EMA9 was slanting down during consolidation
                 consol_start_idx = st["sell_consol_start"]
                 ema9_at_consol_start = df.iloc[consol_start_idx]["ema9"]
-                ema9_slanting_down = ema9_c < ema9_at_consol_start
+                ema9_mid_idx  = consol_start_idx + consol_length // 2
+                ema9_mid_val  = df.iloc[ema9_mid_idx]["ema9"]
+
+                # EMA9 must be lower than start (correct direction)
+                # AND lower than its own midpoint (confirms gradual curl down, not a fluke)
+                ema9_slanting_down = (ema9_c < ema9_at_consol_start) and (ema9_c < ema9_mid_val)
 
                 if ema9_slanting_down:
-                    # Validate 30min crossover
-                    cross_30m = check_30m_ema_crossover(symbol, "SELL")
+                    # Validate 30min EMA alignment
+                    cross_30m = check_30m_ema_alignment(symbol, "SELL")
 
                     if cross_30m:
                         sig_key = f"{symbol}_SNIPER_SELL_{level_name}_{st['sell_consol_start']}"
