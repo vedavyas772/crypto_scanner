@@ -568,7 +568,7 @@ def detect_sniper_signals(symbol, df, pivots):
         "S1": pivots["S1"], "S2": pivots["S2"], "S3": pivots["S3"]
     }
 
-    PROXIMITY_PCT      = 0.02  # candle must close within 2% of pivot to count as consolidation
+    PROXIMITY_PCT      = 0.04  # candle must close within 2% of pivot to count as consolidation
     MIN_CONSOL_CANDLES = 5     # minimum consolidation candles required
     MAX_LOOKBACK       = 30    # how far back to scan for consolidation candles
 
