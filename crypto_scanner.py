@@ -26,17 +26,17 @@
 #   Step 2 → Price closes ABOVE any pivot (after crossover)
 #   → 🟢 BUY AGGRESSIVE ALERT
 # SNIPER BUY:
-#   1H: Price consolidates within 1% below pivot for min 5 candles
+#   1H: Price consolidates within 5% below pivot for min 5 candles
 #   1H: EMA 9 slants upward during consolidation (flat → rising)
 #   1H: Candle closes ABOVE pivot AND above EMA 9
-#   30m: EMA 9 crossed ABOVE EMA 26 within last 3 x 30min candles
+#   30m: EMA 9 above EMA 26 (alignment check — not crossover hunting)
 #   → 🟢 BUY SNIPER ALERT
 #
 # SNIPER SELL:
-#   1H: Price consolidates within 1% above pivot for min 5 candles
+#   1H: Price consolidates within 5% above pivot for min 5 candles
 #   1H: EMA 9 slants downward during consolidation (flat → falling)
 #   1H: Candle closes BELOW pivot AND below EMA 9
-#   30m: EMA 9 crossed BELOW EMA 26 within last 3 x 30min candles
+#   30m: EMA 9 below EMA 26 (alignment check — not crossover hunting)
 #   → 🔴 SELL SNIPER ALERT
 # =============================================================================
 
@@ -572,9 +572,32 @@ def detect_sniper_signals(symbol, df, pivots):
         "S1": pivots["S1"], "S2": pivots["S2"], "S3": pivots["S3"]
     }
 
-    PROXIMITY_PCT      = 0.035  # candle must close within 3.5% of pivot to count as consolidation
+    PROXIMITY_PCT      = 0.05  # candle must close within 5% of pivot to count as consolidation
     MIN_CONSOL_CANDLES = 5     # minimum consolidation candles required
     MAX_LOOKBACK       = 15    # how far back to scan for consolidation candles
+    MAX_BODY_RANGE_PCT = 0.40  # avg candle body must be < 40% of total consol range (no zig-zag)
+
+    def is_tight_consolidation(indices):
+        """
+        Returns True if consolidation candles are tight/ranging — not zig-zagging.
+        Checks that average candle body size is less than 40% of the total
+        price range across all consolidation candles.
+        A zig-zag market has big bodies relative to its range.
+        A tight consolidation has small bodies relative to its range.
+        """
+        if len(indices) < 2:
+            return False
+        bodies = []
+        closes = []
+        for idx in indices:
+            c = df.iloc[idx]
+            bodies.append(abs(c["close"] - c["open"]))
+            closes.append(c["close"])
+        avg_body     = sum(bodies) / len(bodies)
+        consol_range = max(closes) - min(closes)
+        if consol_range == 0:
+            return False
+        return (avg_body / consol_range) < MAX_BODY_RANGE_PCT
 
     candle  = df.iloc[curr_idx]
     ema9_c  = candle["ema9"]
@@ -599,7 +622,7 @@ def detect_sniper_signals(symbol, df, pivots):
                 continue
 
             # Look back through candles BEFORE the trigger
-            # Every candle must close strictly BELOW pivot AND within 3.5%
+            # Every candle must close strictly BELOW pivot AND within 5%
             # Any candle outside this zone immediately stops the count — strictly contiguous
             consol_indices = []
             lookback_start = max(curr_idx - MAX_LOOKBACK, EMA_SLOW)
@@ -615,7 +638,7 @@ def detect_sniper_signals(symbol, df, pivots):
 
             consol_count = len(consol_indices)
 
-            if consol_count >= MIN_CONSOL_CANDLES:
+            if consol_count >= MIN_CONSOL_CANDLES and is_tight_consolidation(consol_indices):
                 # EMA9 slant check — from earliest consol candle to trigger
                 earliest_consol_idx = min(consol_indices)
                 mid_consol_idx      = (earliest_consol_idx + curr_idx) // 2
@@ -625,18 +648,15 @@ def detect_sniper_signals(symbol, df, pivots):
 
                 # Gradual curl: must be rising overall AND in second half
                 # Relaxed: only need ONE of the two to pass if consol is short
-                ema9_rising_overall  = ema9_c > ema9_at_start
+                ema9_rising_overall     = ema9_c > ema9_at_start
                 ema9_rising_second_half = ema9_c > ema9_at_mid
 
                 if consol_count >= 8:
-                    # Long consolidation — require both
                     ema9_slanting_up = ema9_rising_overall and ema9_rising_second_half
                 else:
-                    # Short consolidation (5-7 candles) — just overall rise enough
                     ema9_slanting_up = ema9_rising_overall
 
                 if ema9_slanting_up:
-                    # 30min alignment check
                     aligned_30m = check_30m_ema_alignment(symbol, "BUY")
 
                     if aligned_30m:
@@ -684,7 +704,7 @@ def detect_sniper_signals(symbol, df, pivots):
 
             consol_count = len(consol_indices)
 
-            if consol_count >= MIN_CONSOL_CANDLES:
+            if consol_count >= MIN_CONSOL_CANDLES and is_tight_consolidation(consol_indices):
                 earliest_consol_idx = min(consol_indices)
                 mid_consol_idx      = (earliest_consol_idx + curr_idx) // 2
 
@@ -788,9 +808,9 @@ def send_alert(signal, df=None):
     elif entry == "SNIPER":
         consol = signal.get("consol_candles", "?")
         if direction == "SELL":
-            msg += f"📋 Setup: {consol} candles consolidated within 1% above {signal['pivot_name']} → EMA9 slanted ↓ → Closed below pivot & EMA9 → 30min cross ↓ confirmed\n"
+            msg += f"📋 Setup: {consol} candles consolidated within 5% above {signal['pivot_name']} → EMA9 slanted ↓ → Closed below pivot & EMA9 → 30min EMA aligned ↓\n"
         else:
-            msg += f"📋 Setup: {consol} candles consolidated within 1% below {signal['pivot_name']} → EMA9 slanted ↑ → Closed above pivot & EMA9 → 30min cross ↑ confirmed\n"
+            msg += f"📋 Setup: {consol} candles consolidated within 5% below {signal['pivot_name']} → EMA9 slanted ↑ → Closed above pivot & EMA9 → 30min EMA aligned ↑\n"
     else:
         if direction == "SELL":
             msg += f"📋 Setup: EMA crossed ↓ → Price closed below {signal['pivot_name']}\n"
