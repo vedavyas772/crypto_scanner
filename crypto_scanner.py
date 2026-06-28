@@ -574,7 +574,7 @@ def detect_sniper_signals(symbol, df, pivots):
 
     PROXIMITY_PCT      = 0.035  # candle must close within 3.5% of pivot to count as consolidation
     MIN_CONSOL_CANDLES = 5     # minimum consolidation candles required
-    MAX_LOOKBACK       = 30    # how far back to scan for consolidation candles
+    MAX_LOOKBACK       = 15    # how far back to scan for consolidation candles
 
     candle  = df.iloc[curr_idx]
     ema9_c  = candle["ema9"]
@@ -599,7 +599,8 @@ def detect_sniper_signals(symbol, df, pivots):
                 continue
 
             # Look back through candles BEFORE the trigger
-            # Count candles that were consolidating within 2% BELOW the pivot
+            # Every candle must close strictly BELOW pivot AND within 3.5%
+            # Any candle outside this zone immediately stops the count — strictly contiguous
             consol_indices = []
             lookback_start = max(curr_idx - MAX_LOOKBACK, EMA_SLOW)
 
@@ -607,14 +608,10 @@ def detect_sniper_signals(symbol, df, pivots):
                 c = df.iloc[j]["close"]
                 if level_price * (1 - PROXIMITY_PCT) <= c < level_price:
                     consol_indices.append(j)
-                elif c >= level_price:
-                    # Price was above pivot — stop looking back
-                    # (consolidation must be contiguous below pivot)
-                    break
                 else:
-                    # Price dropped too far below — still count it if
-                    # the majority of candles were in range, just skip this one
-                    continue
+                    # Any candle outside zone — stop immediately
+                    # Handles: candle above pivot, candle too far below
+                    break
 
             consol_count = len(consol_indices)
 
@@ -681,11 +678,9 @@ def detect_sniper_signals(symbol, df, pivots):
                 c = df.iloc[j]["close"]
                 if level_price < c <= level_price * (1 + PROXIMITY_PCT):
                     consol_indices.append(j)
-                elif c <= level_price:
-                    # Price was below pivot — stop looking back
-                    break
                 else:
-                    continue
+                    # Any candle outside zone — stop immediately
+                    break
 
             consol_count = len(consol_indices)
 
