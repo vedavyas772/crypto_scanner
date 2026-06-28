@@ -487,7 +487,9 @@ def detect_signals(symbol, df, pivots):
                 )
 
                 # SELL: fire only if the crossover timestamp hasn't been used before
+                # AND EMA9 is still below EMA26 at trigger (alignment confirmed)
                 if (clean_break_below
+                        and candle["ema9"] < candle["ema26"]
                         and most_recent_bear_cross_ts is not None
                         and most_recent_bear_cross_ts != state["_agg_bear_cross_used"]):
                     sig_key = f"{symbol}_AGG_SELL_{level_name}_{most_recent_bear_cross_ts}"
@@ -503,7 +505,9 @@ def detect_signals(symbol, df, pivots):
                         state["_agg_bear_cross_used"] = most_recent_bear_cross_ts
 
                 # BUY: same one-shot-per-crossover rule using timestamp
+                # AND EMA9 must still be above EMA26 at trigger (alignment confirmed)
                 if (clean_break_above
+                        and candle["ema9"] > candle["ema26"]
                         and most_recent_bull_cross_ts is not None
                         and most_recent_bull_cross_ts != state["_agg_bull_cross_used"]):
                     sig_key = f"{symbol}_AGG_BUY_{level_name}_{most_recent_bull_cross_ts}"
@@ -568,7 +572,7 @@ def detect_sniper_signals(symbol, df, pivots):
         "S1": pivots["S1"], "S2": pivots["S2"], "S3": pivots["S3"]
     }
 
-    PROXIMITY_PCT      = 0.04  # candle must close within 2% of pivot to count as consolidation
+    PROXIMITY_PCT      = 0.035  # candle must close within 3.5% of pivot to count as consolidation
     MIN_CONSOL_CANDLES = 5     # minimum consolidation candles required
     MAX_LOOKBACK       = 30    # how far back to scan for consolidation candles
 
@@ -581,6 +585,18 @@ def detect_sniper_signals(symbol, df, pivots):
         # ══ SNIPER BUY ═══════════════════════════════════════════════════════
         # Trigger: current candle closes above pivot AND above EMA9
         if candle["close"] > level_price and candle["close"] > ema9_c:
+
+            # Gate: EMA9 must be rising into the trigger candle
+            # Net rising over last 3 candles + rising in at least one step
+            ema9_prev1 = df.iloc[curr_idx - 1]["ema9"]
+            ema9_prev2 = df.iloc[curr_idx - 2]["ema9"]
+            ema9_rising_into_trigger = (
+                ema9_c > ema9_prev2 and  # net rising over 3 candles
+                (ema9_c > ema9_prev1 or ema9_prev1 > ema9_prev2)  # rising in at least one step
+            )
+
+            if not ema9_rising_into_trigger:
+                continue
 
             # Look back through candles BEFORE the trigger
             # Count candles that were consolidating within 2% BELOW the pivot
@@ -646,6 +662,17 @@ def detect_sniper_signals(symbol, df, pivots):
         # ══ SNIPER SELL ══════════════════════════════════════════════════════
         # Trigger: current candle closes below pivot AND below EMA9
         if candle["close"] < level_price and candle["close"] < ema9_c:
+
+            # Gate: EMA9 must be falling into the trigger candle
+            ema9_prev1 = df.iloc[curr_idx - 1]["ema9"]
+            ema9_prev2 = df.iloc[curr_idx - 2]["ema9"]
+            ema9_falling_into_trigger = (
+                ema9_c < ema9_prev2 and  # net falling over 3 candles
+                (ema9_c < ema9_prev1 or ema9_prev1 < ema9_prev2)  # falling in at least one step
+            )
+
+            if not ema9_falling_into_trigger:
+                continue
 
             consol_indices = []
             lookback_start = max(curr_idx - MAX_LOOKBACK, EMA_SLOW)
