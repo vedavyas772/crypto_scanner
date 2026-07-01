@@ -26,16 +26,20 @@
 #   Step 2 → Price closes ABOVE any pivot (after crossover)
 #   → 🟢 BUY AGGRESSIVE ALERT
 # SNIPER BUY:
-#   1H: Price consolidates within 5% below pivot for min 5 candles
+#   1H: 1H EMA9 must be ABOVE EMA26 at trigger (bullish 1H alignment gate)
+#   1H: Price consolidates within 3.5% below pivot for min 5 candles
 #   1H: EMA 9 slants upward during consolidation (flat → rising)
 #   1H: Candle closes ABOVE pivot AND above EMA 9
+#   1H: At least 40% of candle body must close above pivot
 #   30m: EMA 9 above EMA 26 (alignment check — not crossover hunting)
 #   → 🟢 BUY SNIPER ALERT
 #
 # SNIPER SELL:
-#   1H: Price consolidates within 5% above pivot for min 5 candles
+#   1H: 1H EMA9 must be BELOW EMA26 at trigger (bearish 1H alignment gate)
+#   1H: Price consolidates within 3.5% above pivot for min 5 candles
 #   1H: EMA 9 slants downward during consolidation (flat → falling)
 #   1H: Candle closes BELOW pivot AND below EMA 9
+#   1H: At least 40% of candle body must close below pivot
 #   30m: EMA 9 below EMA 26 (alignment check — not crossover hunting)
 #   → 🔴 SELL SNIPER ALERT
 # =============================================================================
@@ -325,7 +329,7 @@ def detect_signals(symbol, df, pivots):
     }
 
     MAX_WAIT_FOR_CROSS   = 15   # candles after break to wait for EMA crossover (RETEST path)
-    MIN_BODY_BREAK_PCT   = 0.25 # at least 25% of candle body must close beyond pivot
+    MIN_BODY_BREAK_PCT   = 0.40 # at least 40% of candle body must close beyond pivot
 
     if (symbol not in coin_state
             or not isinstance(coin_state[symbol], dict)
@@ -572,7 +576,8 @@ def detect_sniper_signals(symbol, df, pivots):
         "S1": pivots["S1"], "S2": pivots["S2"], "S3": pivots["S3"]
     }
 
-    PROXIMITY_PCT      = 0.05  # candle must close within 5% of pivot to count as consolidation
+    PROXIMITY_PCT       = 0.035  # candle must close within 3.5% of pivot to count as consolidation
+    MIN_BODY_CLOSE_PCT  = 0.40  # at least 40% of candle body must close beyond pivot
     MIN_CONSOL_CANDLES = 5     # minimum consolidation candles required
     MAX_LOOKBACK       = 15    # how far back to scan for consolidation candles
     MAX_BODY_RANGE_PCT = 0.40  # avg candle body must be < 40% of total consol range (no zig-zag)
@@ -608,6 +613,17 @@ def detect_sniper_signals(symbol, df, pivots):
         # ══ SNIPER BUY ═══════════════════════════════════════════════════════
         # Trigger: current candle closes above pivot AND above EMA9
         if candle["close"] > level_price and candle["close"] > ema9_c:
+
+            # Gate: 1H EMA9 must be ABOVE EMA26 at trigger — confirms bullish
+            # alignment on 1H itself, not just price vs EMA9 in isolation.
+            if ema9_c <= ema26_c:
+                continue
+
+            # Gate: at least 40% of candle body must close above pivot
+            body_size = abs(candle["close"] - candle["open"])
+            body_above = candle["close"] - level_price
+            if body_size == 0 or (body_above / body_size) < MIN_BODY_CLOSE_PCT:
+                continue
 
             # Gate: EMA9 must be rising into the trigger candle
             # Net rising over last 3 candles + rising in at least one step
@@ -679,6 +695,17 @@ def detect_sniper_signals(symbol, df, pivots):
         # ══ SNIPER SELL ══════════════════════════════════════════════════════
         # Trigger: current candle closes below pivot AND below EMA9
         if candle["close"] < level_price and candle["close"] < ema9_c:
+
+            # Gate: 1H EMA9 must be BELOW EMA26 at trigger — confirms bearish
+            # alignment on 1H itself, not just price vs EMA9 in isolation.
+            if ema9_c >= ema26_c:
+                continue
+
+            # Gate: at least 40% of candle body must close below pivot
+            body_size = abs(candle["close"] - candle["open"])
+            body_below = level_price - candle["close"]
+            if body_size == 0 or (body_below / body_size) < MIN_BODY_CLOSE_PCT:
+                continue
 
             # Gate: EMA9 must be falling into the trigger candle
             ema9_prev1 = df.iloc[curr_idx - 1]["ema9"]
@@ -808,9 +835,9 @@ def send_alert(signal, df=None):
     elif entry == "SNIPER":
         consol = signal.get("consol_candles", "?")
         if direction == "SELL":
-            msg += f"📋 Setup: {consol} candles consolidated within 5% above {signal['pivot_name']} → EMA9 slanted ↓ → Closed below pivot & EMA9 → 30min EMA aligned ↓\n"
+            msg += f"📋 Setup: {consol} candles consolidated within 3.5% above {signal['pivot_name']} → EMA9 slanted ↓ → Closed below pivot & EMA9 → 30min EMA aligned ↓\n"
         else:
-            msg += f"📋 Setup: {consol} candles consolidated within 5% below {signal['pivot_name']} → EMA9 slanted ↑ → Closed above pivot & EMA9 → 30min EMA aligned ↑\n"
+            msg += f"📋 Setup: {consol} candles consolidated within 3.5% below {signal['pivot_name']} → EMA9 slanted ↑ → Closed above pivot & EMA9 → 30min EMA aligned ↑\n"
     else:
         if direction == "SELL":
             msg += f"📋 Setup: EMA crossed ↓ → Price closed below {signal['pivot_name']}\n"
