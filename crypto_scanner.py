@@ -42,9 +42,24 @@
 #   1H: At least 40% of candle body must close below pivot
 #   30m: EMA 9 below EMA 26 (alignment check — not crossover hunting)
 #   → 🔴 SELL SNIPER ALERT
+# IMPULSE BUY:
+#   Leg 1  : 3-5 candles sharp upward move, max 1 small red candle
+#            EMA9 > EMA26 throughout
+#   Consol : 4-10 tight candles near top of leg 1 (upper 60% of leg range)
+#            EMA9 > EMA26 maintained, avg body smaller than leg bodies
+#   Trigger: single green candle whose BODY engulfs full consolidation range
+#            EMA9 > EMA26 at trigger
+#   → 🟢 BUY IMPULSE ALERT
+#
+# IMPULSE SELL:
+#   Leg 1  : 3-5 candles sharp downward move, max 1 small green candle
+#            EMA9 < EMA26 throughout
+#   Consol : 4-10 tight candles near bottom of leg 1 (lower 60% of leg range)
+#            EMA9 < EMA26 maintained, avg body smaller than leg bodies
+#   Trigger: single red candle whose BODY engulfs full consolidation range
+#            EMA9 < EMA26 at trigger
+#   → 🔴 SELL IMPULSE ALERT
 # =============================================================================
-
-import requests
 import pandas as pd
 import numpy as np
 import time
@@ -329,7 +344,7 @@ def detect_signals(symbol, df, pivots):
     }
 
     MAX_WAIT_FOR_CROSS   = 15   # candles after break to wait for EMA crossover (RETEST path)
-    MIN_BODY_BREAK_PCT   = 0.40 # at least 40% of candle body must close beyond pivot
+    MIN_BODY_BREAK_PCT   = 0.30 # at least 25% of candle body must close beyond pivot
 
     if (symbol not in coin_state
             or not isinstance(coin_state[symbol], dict)
@@ -338,14 +353,12 @@ def detect_signals(symbol, df, pivots):
             lvl: {
                 "sell": {"phase": "idle", "break_idx": None, "cross_idx": None},
                 "buy" : {"phase": "idle", "break_idx": None, "cross_idx": None},
+                "_agg_bear_cross_used": None,
+                "_agg_bull_cross_used": None,
             }
             for lvl in pivot_levels
         }
         coin_state[symbol]["_last_idx"] = EMA_SLOW
-        # Global (per-direction, not per-pivot) tracking of last crossover
-        # already consumed by an AGGRESSIVE signal.
-        coin_state[symbol]["_agg_bear_cross_used"] = None
-        coin_state[symbol]["_agg_bull_cross_used"] = None
 
     state = coin_state[symbol]
     start_idx = max(state.get("_last_idx", EMA_SLOW), EMA_SLOW, 1)
@@ -495,7 +508,7 @@ def detect_signals(symbol, df, pivots):
                 if (clean_break_below
                         and candle["ema9"] < candle["ema26"]
                         and most_recent_bear_cross_ts is not None
-                        and most_recent_bear_cross_ts != state["_agg_bear_cross_used"]):
+                        and most_recent_bear_cross_ts != state[level_name]["_agg_bear_cross_used"]):
                     sig_key = f"{symbol}_AGG_SELL_{level_name}_{most_recent_bear_cross_ts}"
                     if sig_key not in alerted_this_cycle:
                         signals.append({
@@ -506,14 +519,14 @@ def detect_signals(symbol, df, pivots):
                             "time": candle_time_str(i),
                         })
                         alerted_this_cycle.add(sig_key)
-                        state["_agg_bear_cross_used"] = most_recent_bear_cross_ts
+                        state[level_name]["_agg_bear_cross_used"] = most_recent_bear_cross_ts
 
                 # BUY: same one-shot-per-crossover rule using timestamp
                 # AND EMA9 must still be above EMA26 at trigger (alignment confirmed)
                 if (clean_break_above
                         and candle["ema9"] > candle["ema26"]
                         and most_recent_bull_cross_ts is not None
-                        and most_recent_bull_cross_ts != state["_agg_bull_cross_used"]):
+                        and most_recent_bull_cross_ts != state[level_name]["_agg_bull_cross_used"]):
                     sig_key = f"{symbol}_AGG_BUY_{level_name}_{most_recent_bull_cross_ts}"
                     if sig_key not in alerted_this_cycle:
                         signals.append({
@@ -524,7 +537,7 @@ def detect_signals(symbol, df, pivots):
                             "time": candle_time_str(i),
                         })
                         alerted_this_cycle.add(sig_key)
-                        state["_agg_bull_cross_used"] = most_recent_bull_cross_ts
+                        state[level_name]["_agg_bull_cross_used"] = most_recent_bull_cross_ts
 
     state["_last_idx"] = curr_idx + 1
     return signals
@@ -769,6 +782,309 @@ def detect_sniper_signals(symbol, df, pivots):
     return signals
 
 
+def detect_impulse_signals(symbol, df):
+    """
+    IMPULSE BUY / IMPULSE SELL — 4th signal type.
+
+    Pattern (BUY side):
+      LEG 1  : 3-5 candles with a sharp net upward move.
+               Max 1 small red candle allowed within the leg.
+               A red candle is "small" if its body is < 50% of the avg
+               green candle body in the same leg.
+               EMA9 > EMA26 throughout leg 1.
+
+      CONSOL : 4-10 candles of tight consolidation near the TOP of leg 1.
+               Price must stay within the upper 60% of leg 1's range
+               (not collapsing back down).
+               EMA9 > EMA26 maintained throughout.
+               Tightness: avg body < 50% of leg 1 avg body (smaller candles).
+
+      TRIGGER: Single candle whose BODY (open-to-close) engulfs the ENTIRE
+               consolidation range (body open <= consol low AND body close >= consol high).
+               EMA9 > EMA26 at trigger.
+               Entry on close of this candle.
+
+    SELL side is the exact mirror.
+    """
+    if df is None or len(df) < EMA_SLOW + 20:
+        return []
+
+    signals  = []
+    curr_idx = len(df) - 1
+
+    df["ema9"]  = calculate_ema(df["close"], EMA_FAST)
+    df["ema26"] = calculate_ema(df["close"], EMA_SLOW)
+
+    def candle_time_str(idx):
+        ts = df.iloc[idx]["time"]
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # ── Constants ────────────────────────────────────────────────────────────
+    LEG_MIN       = 3    # minimum candles in leg 1
+    LEG_MAX       = 5    # maximum candles in leg 1
+    CONSOL_MIN    = 4    # minimum consolidation candles
+    CONSOL_MAX    = 10   # maximum consolidation candles
+    MAX_OPP_BODY_PCT = 0.50  # opposite candle body must be < 50% of avg leg body
+
+    trigger_candle = df.iloc[curr_idx]
+    ema9_t  = trigger_candle["ema9"]
+    ema26_t = trigger_candle["ema26"]
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # IMPULSE BUY
+    # ══════════════════════════════════════════════════════════════════════════
+    if ema9_t > ema26_t:  # EMA9 above EMA26 at trigger
+
+        # Scan possible consolidation end points ending just before trigger
+        for consol_len in range(CONSOL_MIN, CONSOL_MAX + 1):
+            consol_end   = curr_idx - 1          # last consol candle
+            consol_start = curr_idx - consol_len  # first consol candle
+
+            if consol_start <= EMA_SLOW + LEG_MAX:
+                continue
+
+            consol_df = df.iloc[consol_start:consol_end + 1]
+
+            # Consolidation EMA alignment — EMA9 > EMA26 throughout
+            if not (consol_df["ema9"] > consol_df["ema26"]).all():
+                continue
+
+            # Consolidation range
+            consol_high = consol_df["close"].max()
+            consol_low  = consol_df["close"].min()
+            consol_range = consol_high - consol_low
+            if consol_range == 0:
+                continue
+
+            # Consolidation tightness — avg body must be smaller than leg bodies
+            consol_avg_body = consol_df.apply(
+                lambda r: abs(r["close"] - r["open"]), axis=1
+            ).mean()
+
+            # ── Scan possible leg 1 lengths ───────────────────────────────
+            for leg_len in range(LEG_MIN, LEG_MAX + 1):
+                leg_end   = consol_start - 1
+                leg_start = leg_end - leg_len + 1
+
+                if leg_start < EMA_SLOW:
+                    continue
+
+                leg_df = df.iloc[leg_start:leg_end + 1]
+
+                # EMA9 > EMA26 throughout leg 1
+                if not (leg_df["ema9"] > leg_df["ema26"]).all():
+                    continue
+
+                # Identify green and red candles in leg
+                green_candles = leg_df[leg_df["close"] > leg_df["open"]]
+                red_candles   = leg_df[leg_df["close"] <= leg_df["open"]]
+
+                # Max 1 red candle in leg
+                if len(red_candles) > 1:
+                    continue
+
+                # Must have at least 2 green candles
+                if len(green_candles) < 2:
+                    continue
+
+                # Red candle must be small vs avg green body
+                avg_green_body = (green_candles["close"] - green_candles["open"]).mean()
+                if len(red_candles) == 1:
+                    red_body = abs(
+                        red_candles.iloc[0]["close"] - red_candles.iloc[0]["open"]
+                    )
+                    if red_body >= avg_green_body * MAX_OPP_BODY_PCT:
+                        continue  # red candle too large — not a small pullback
+
+                # Leg 1 net move must be significant
+                leg_net_move = leg_df.iloc[-1]["close"] - leg_df.iloc[0]["open"]
+                if leg_net_move <= 0:
+                    continue  # net move must be upward
+
+                # Leg 1 move must be larger than consolidation range
+                # (ensures the move was sharp relative to the consolidation)
+                if leg_net_move <= consol_range:
+                    continue
+
+                # Consolidation avg body must be smaller than leg avg body
+                # (ensures consolidation is tighter than the impulse leg)
+                leg_avg_body = leg_df.apply(
+                    lambda r: abs(r["close"] - r["open"]), axis=1
+                ).mean()
+                if consol_avg_body >= leg_avg_body:
+                    continue
+
+                # Price must stay in upper 60% of leg 1 range during consolidation
+                leg_high = leg_df["high"].max()
+                leg_low  = leg_df["low"].min()
+                leg_range = leg_high - leg_low
+                if leg_range == 0:
+                    continue
+                upper_60_threshold = leg_low + leg_range * 0.40
+                if consol_low < upper_60_threshold:
+                    continue  # consolidation dipped too low into leg 1
+
+                # ── Trigger candle check ──────────────────────────────────
+                # Body must engulf entire consolidation range
+                trig_body_low  = min(trigger_candle["open"], trigger_candle["close"])
+                trig_body_high = max(trigger_candle["open"], trigger_candle["close"])
+
+                body_engulfs = (
+                    trig_body_low  <= consol_low and
+                    trig_body_high >= consol_high
+                )
+
+                if not body_engulfs:
+                    continue
+
+                # Must be a green trigger candle
+                if trigger_candle["close"] <= trigger_candle["open"]:
+                    continue
+
+                sig_key = f"{symbol}_IMPULSE_BUY_{leg_start}_{consol_start}"
+                if sig_key not in alerted_this_cycle:
+                    signals.append({
+                        "symbol"      : symbol,
+                        "type"        : "BUY",
+                        "entry"       : "IMPULSE",
+                        "pivot_name"  : "—",
+                        "pivot_price" : 0,
+                        "cmp"         : round(trigger_candle["close"], 6),
+                        "ema9"        : round(ema9_t, 6),
+                        "ema26"       : round(ema26_t, 6),
+                        "leg_candles" : leg_len,
+                        "consol_candles": consol_len,
+                        "consol_high" : round(consol_high, 6),
+                        "consol_low"  : round(consol_low, 6),
+                        "time"        : candle_time_str(curr_idx),
+                    })
+                    alerted_this_cycle.add(sig_key)
+                break  # found valid setup for this consol_len — no need to try more leg lengths
+            else:
+                continue
+            break  # found valid consol_len — stop scanning
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # IMPULSE SELL (exact mirror)
+    # ══════════════════════════════════════════════════════════════════════════
+    if ema9_t < ema26_t:  # EMA9 below EMA26 at trigger
+
+        for consol_len in range(CONSOL_MIN, CONSOL_MAX + 1):
+            consol_end   = curr_idx - 1
+            consol_start = curr_idx - consol_len
+
+            if consol_start <= EMA_SLOW + LEG_MAX:
+                continue
+
+            consol_df = df.iloc[consol_start:consol_end + 1]
+
+            if not (consol_df["ema9"] < consol_df["ema26"]).all():
+                continue
+
+            consol_high = consol_df["close"].max()
+            consol_low  = consol_df["close"].min()
+            consol_range = consol_high - consol_low
+            if consol_range == 0:
+                continue
+
+            consol_avg_body = consol_df.apply(
+                lambda r: abs(r["close"] - r["open"]), axis=1
+            ).mean()
+
+            for leg_len in range(LEG_MIN, LEG_MAX + 1):
+                leg_end   = consol_start - 1
+                leg_start = leg_end - leg_len + 1
+
+                if leg_start < EMA_SLOW:
+                    continue
+
+                leg_df = df.iloc[leg_start:leg_end + 1]
+
+                if not (leg_df["ema9"] < leg_df["ema26"]).all():
+                    continue
+
+                red_candles   = leg_df[leg_df["close"] < leg_df["open"]]
+                green_candles = leg_df[leg_df["close"] >= leg_df["open"]]
+
+                if len(green_candles) > 1:
+                    continue
+
+                if len(red_candles) < 2:
+                    continue
+
+                avg_red_body = (red_candles["open"] - red_candles["close"]).mean()
+                if len(green_candles) == 1:
+                    green_body = abs(
+                        green_candles.iloc[0]["close"] - green_candles.iloc[0]["open"]
+                    )
+                    if green_body >= avg_red_body * MAX_OPP_BODY_PCT:
+                        continue
+
+                leg_net_move = leg_df.iloc[0]["open"] - leg_df.iloc[-1]["close"]
+                if leg_net_move <= 0:
+                    continue
+
+                if leg_net_move <= consol_range:
+                    continue
+
+                leg_avg_body = leg_df.apply(
+                    lambda r: abs(r["close"] - r["open"]), axis=1
+                ).mean()
+                if consol_avg_body >= leg_avg_body:
+                    continue
+
+                # Price must stay in lower 60% of leg 1 range during consolidation
+                leg_high = leg_df["high"].max()
+                leg_low  = leg_df["low"].min()
+                leg_range = leg_high - leg_low
+                if leg_range == 0:
+                    continue
+                lower_60_threshold = leg_high - leg_range * 0.40
+                if consol_high > lower_60_threshold:
+                    continue
+
+                # Trigger body must engulf entire consolidation range downward
+                trig_body_low  = min(trigger_candle["open"], trigger_candle["close"])
+                trig_body_high = max(trigger_candle["open"], trigger_candle["close"])
+
+                body_engulfs = (
+                    trig_body_low  <= consol_low and
+                    trig_body_high >= consol_high
+                )
+
+                if not body_engulfs:
+                    continue
+
+                # Must be a red trigger candle
+                if trigger_candle["close"] >= trigger_candle["open"]:
+                    continue
+
+                sig_key = f"{symbol}_IMPULSE_SELL_{leg_start}_{consol_start}"
+                if sig_key not in alerted_this_cycle:
+                    signals.append({
+                        "symbol"      : symbol,
+                        "type"        : "SELL",
+                        "entry"       : "IMPULSE",
+                        "pivot_name"  : "—",
+                        "pivot_price" : 0,
+                        "cmp"         : round(trigger_candle["close"], 6),
+                        "ema9"        : round(ema9_t, 6),
+                        "ema26"       : round(ema26_t, 6),
+                        "leg_candles" : leg_len,
+                        "consol_candles": consol_len,
+                        "consol_high" : round(consol_high, 6),
+                        "consol_low"  : round(consol_low, 6),
+                        "time"        : candle_time_str(curr_idx),
+                    })
+                    alerted_this_cycle.add(sig_key)
+                break
+            else:
+                continue
+            break
+
+    return signals
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ALERTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -838,6 +1154,15 @@ def send_alert(signal, df=None):
             msg += f"📋 Setup: {consol} candles consolidated within 3.5% above {signal['pivot_name']} → EMA9 slanted ↓ → Closed below pivot & EMA9 → 30min EMA aligned ↓\n"
         else:
             msg += f"📋 Setup: {consol} candles consolidated within 3.5% below {signal['pivot_name']} → EMA9 slanted ↑ → Closed above pivot & EMA9 → 30min EMA aligned ↑\n"
+    elif entry == "IMPULSE":
+        leg    = signal.get("leg_candles", "?")
+        consol = signal.get("consol_candles", "?")
+        c_high = signal.get("consol_high", "?")
+        c_low  = signal.get("consol_low", "?")
+        if direction == "SELL":
+            msg += f"📋 Setup: {leg}-candle sharp drop (Leg 1) → {consol}-candle tight consolidation near bottom (Low: ${c_low} High: ${c_high}) → Body engulfed consolidation ↓\n"
+        else:
+            msg += f"📋 Setup: {leg}-candle sharp rise (Leg 1) → {consol}-candle tight consolidation near top (Low: ${c_low} High: ${c_high}) → Body engulfed consolidation ↑\n"
     else:
         if direction == "SELL":
             msg += f"📋 Setup: EMA crossed ↓ → Price closed below {signal['pivot_name']}\n"
@@ -933,8 +1258,12 @@ def run_scan(symbols):
             sniper_signals = detect_sniper_signals(symbol, df, pivots)
             all_signals.extend(sniper_signals)
 
+            # Detect IMPULSE signals
+            impulse_signals = detect_impulse_signals(symbol, df)
+            all_signals.extend(impulse_signals)
+
             # Send individual alerts
-            for sig in signals + sniper_signals:
+            for sig in signals + sniper_signals + impulse_signals:
                 send_alert(sig, df)
 
             time.sleep(0.1)  # Rate limit
